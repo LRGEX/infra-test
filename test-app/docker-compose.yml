@@ -87,6 +87,7 @@ services:
       MAX_CLIENT_CONN: 200
       DEFAULT_POOL_SIZE: 25
       LISTEN_PORT: 6432
+      AUTH_TYPE: scram-sha-256
     ports:
       - "6432:6432"
     networks:
@@ -169,7 +170,7 @@ services:
       dockerfile: Dockerfile
     container_name: kanban-app
     environment:
-      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/postgres
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@pgbouncer:6432/postgres
       - AUTHENTIK_URL=http://localhost:9000
       - AUTHENTIK_INTERNAL_URL=http://authentik:9000
       - AUTHENTIK_CLIENT_ID=${AUTHENTIK_CLIENT_ID}
