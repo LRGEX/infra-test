@@ -1,0 +1,209 @@
+services:
+  # PostgreSQL Database (Latest stable: 17.2)
+  postgres:
+    image: postgres:17.2-alpine
+    container_name: kanban-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - kanban-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # WAL-G S3 Backup Service (Third-party - baunach/postgres-wal-g)
+  # Most popular community image with WAL-G pre-installed
+  walg:
+    image: baunach/postgres-wal-g:17.6-trixie-wal-g-3.0.6-ubuntu-24.04
+    container_name: kanban-walg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: postgres
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_ENDPOINT: ${AWS_ENDPOINT:-https://s3.amazonaws.com}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      WALG_S3_PREFIX: ${WALG_S3_PREFIX:-s3://kanban-backups}
+      WALG_COMPRESSION_METHOD: gzip
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo "Waiting for PostgreSQL..."
+        until pg_isready -h postgres -p 5432; do
+          echo "PostgreSQL is unavailable - sleeping"
+          sleep 2
+        done
+
+        echo "Checking WAL-G installation..."
+        which wal-g && wal-g backup-list || echo "No backups yet"
+
+        echo "WAL-G backup service running..."
+        echo "Press Ctrl+C to stop (container will restart)"
+
+        # Continuous backup monitoring
+        while true; do
+          echo "[$$(date)] Checking backup status..."
+          wal-g backup-list || echo "No backups yet"
+
+          echo "[$$(date)] Forcing WAL switch..."
+          PGPASSWORD=$${POSTGRES_PASSWORD} psql -h postgres -U postgres -d postgres -c "SELECT pg_switch_wal();" || true
+
+          echo "[$$(date)] Waiting 60 seconds..."
+          sleep 60
+        done
+    networks:
+      - kanban-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # PgBouncer Connection Pooler (Latest stable: 1.23.1)
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: kanban-pgbouncer
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      DB_NAME: postgres
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 200
+      DEFAULT_POOL_SIZE: 25
+      LISTEN_PORT: 6432
+    ports:
+      - "6432:6432"
+    networks:
+      - kanban-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Redis Cache (Latest stable: 7.2.6)
+  redis:
+    image: redis:7.2.6-alpine
+    container_name: kanban-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - kanban-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Authentik Authentication (Latest stable: 2024.12.2)
+  authentik:
+    image: ghcr.io/goauthentik/server:2024.12.2
+    container_name: kanban-authentik
+    command: server
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:-change-me-this-is-insecure}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__NAME: postgres
+      AUTHENTIK_POSTGRESQL__USER: postgres
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      AUTHENTIK_POSTGRESQL__PORT: 5432
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_REDIS__PORT: 6379
+    ports:
+      - "9000:9000"
+    networks:
+      - kanban-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Authentik Worker (Latest stable: 2024.12.2)
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2024.12.2
+    container_name: kanban-authentik-worker
+    command: worker
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:-change-me-this-is-insecure}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__NAME: postgres
+      AUTHENTIK_POSTGRESQL__USER: postgres
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      AUTHENTIK_POSTGRESQL__PORT: 5432
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_REDIS__PORT: 6379
+    networks:
+      - kanban-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Test Application
+  test-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kanban-app
+    environment:
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/postgres
+      - AUTHENTIK_URL=http://localhost:9000
+      - AUTHENTIK_INTERNAL_URL=http://authentik:9000
+      - AUTHENTIK_CLIENT_ID=${AUTHENTIK_CLIENT_ID}
+      - AUTHENTIK_CLIENT_SECRET=${AUTHENTIK_CLIENT_SECRET}
+      - AUTHENTIK_REDIRECT_URI=http://localhost:3000/api/auth/callback
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-change-this-jwt-secret-minimum-32-chars}
+      - NEXT_PUBLIC_APP_URL=http://localhost:3000
+      - NODE_ENV=production
+    ports:
+      - "3000:3000"
+    networks:
+      - kanban-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      authentik:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  kanban-network:
+    driver: bridge
